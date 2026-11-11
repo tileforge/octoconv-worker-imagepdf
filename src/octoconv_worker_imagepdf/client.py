@@ -242,7 +242,7 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
     watcher.start()
     try:
         while not done.is_set():
-            if flag.outcome:
+            if flag.outcome and flag.outcome != "complete":
                 return
             wait = renew_wait(lease_seconds, lease_until, deadline, datetime.now(timezone.utc))
             if done.wait(wait):
@@ -278,14 +278,14 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
                     return
                 continue
             except (OriginRejected, OSError, http.client.HTTPException, json.JSONDecodeError):
-                if flag.outcome:
+                if flag.outcome and flag.outcome != "complete":
                     return
                 if lease_until is not None and datetime.now(timezone.utc) >= lease_until:
                     track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
                     return
                 continue
             apply_control(run, core, ctx, token, body.get("control") or {})
-            if flag.outcome:
+            if flag.outcome and flag.outcome != "complete":
                 return
             nxt = parse_time(body.get("lease_expires_at"))
             if nxt is not None:
@@ -395,7 +395,6 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
     require_https(target["href"])
     if parse_time(assignment.get("attempt_deadline")) is None or parse_time(assignment.get("lease_expires_at")) is None:
         return fail(core, ctx, token, assignment, "engine_error", "assignment")
-    attempt = assignment["attempt_token"]
     attempt_id = assignment["attempt_id"]
     flag = StopFlag()
     done = threading.Event()
@@ -433,15 +432,16 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
             return None
         if status < 200 or status >= 300:
             return fail(core, ctx, token, assignment, "engine_error", "input")
-        post_json(
+        if post_attempt(
             core,
             ctx,
+            token,
+            assignment,
+            run,
+            flag,
             "/worker/v1/attempts/" + attempt_id + "/progress",
             progress_request(0),
-            token,
-            attempt,
-        )
-        if flag.outcome:
+        ) is None:
             return None
         try:
             pdf = png_to_pdf(png)
@@ -458,15 +458,16 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
             return fail(core, ctx, token, assignment, "engine_error", "output too large")
         if flag.outcome:
             return None
-        post_json(
+        if post_attempt(
             core,
             ctx,
+            token,
+            assignment,
+            run,
+            flag,
             "/worker/v1/attempts/" + attempt_id + "/progress",
             progress_request(99),
-            token,
-            attempt,
-        )
-        if flag.outcome:
+        ) is None:
             return None
         put_status, _ = request(
             "PUT",
@@ -480,16 +481,20 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
             return None
         if put_status < 200 or put_status >= 300:
             return fail(core, ctx, token, assignment, "engine_error", "output")
-        if not flag.claim("complete"):
-            return None
-        return post_json(
+        result = post_attempt(
             core,
             ctx,
+            token,
+            assignment,
+            run,
+            flag,
             "/worker/v1/attempts/" + attempt_id + "/complete",
             complete_request(pdf),
-            token,
-            attempt,
         )
+        if result is None:
+            return None
+        flag.claim("complete")
+        return result
     finally:
         done.set()
         if started:
@@ -504,6 +509,25 @@ def img2pdf_error():
     import img2pdf
 
     return img2pdf.ImageOpenError
+
+
+def post_attempt(core, ctx, token, assignment, run, flag, path, body):
+    try:
+        return post_json(
+            core,
+            ctx,
+            path,
+            body,
+            token,
+            assignment.get("attempt_token", ""),
+        )
+    except ProtocolError as err:
+        if flag.outcome:
+            return None
+        if err.code == "attempt_not_active":
+            track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
+            return None
+        raise
 
 
 def fail(core, ctx, token, assignment, engine_code, message):
