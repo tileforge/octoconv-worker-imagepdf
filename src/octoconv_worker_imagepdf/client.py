@@ -107,12 +107,13 @@ def _headers(token, attempt, content_type):
     return headers
 
 
-def post_json(core, ctx, path, body, token="", attempt=""):
+def post_json(core, ctx, path, body, token="", attempt="", timeout=60):
     status, payload = request(
         "POST",
         core + path,
         body=dumps(body) if isinstance(body, dict) else body,
         headers=_headers(token, attempt, "application/json"),
+        timeout=timeout,
         context=ctx,
         limit=1024 * 1024,
     )
@@ -180,43 +181,89 @@ def apply_control(run, core, ctx, token, control):
 def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
     lease_until = parse_time(assignment.get("lease_expires_at"))
     deadline = parse_time(assignment.get("attempt_deadline"))
-    while not done.is_set():
-        wait = renew_wait(lease_seconds, lease_until, deadline, datetime.now(timezone.utc))
-        if done.wait(wait):
-            return
-        now = datetime.now(timezone.utc)
-        if lease_until is not None and now >= lease_until:
+    state = {"until": lease_until}
+    state_lock = threading.Lock()
+    stop = threading.Event()
+
+    def expire():
+        while not stop.is_set():
+            with state_lock:
+                until = state["until"]
+            if until is None:
+                stop.wait()
+                return
+            delay = (until - datetime.now(timezone.utc)).total_seconds()
+            if delay > 0 and stop.wait(delay):
+                return
+            with state_lock:
+                until = state["until"]
+            if stop.is_set() or until is None or datetime.now(timezone.utc) < until:
+                continue
             if flag.claim("lease_lost"):
                 post_stopped(core, ctx, token, assignment, "lease_lost")
             return
-        if lease_until is not None and deadline is not None and lease_until >= deadline:
-            continue
-        try:
-            body = post_json(
-                core,
-                ctx,
-                "/worker/v1/attempts/" + assignment["attempt_id"] + "/lease",
-                {"protocol_version": 1},
-                token,
-                assignment.get("attempt_token", ""),
-            )
-        except ProtocolError as err:
-            if err.code == "session_closed":
-                flag.claim("session_closed")
+
+    watcher = threading.Thread(target=expire, daemon=True)
+    watcher.start()
+    try:
+        while not done.is_set():
+            if flag.outcome:
                 return
-            if err.code == "attempt_not_active":
+            wait = renew_wait(lease_seconds, lease_until, deadline, datetime.now(timezone.utc))
+            if done.wait(wait):
+                return
+            now = datetime.now(timezone.utc)
+            if lease_until is not None and now >= lease_until:
                 if flag.claim("lease_lost"):
                     post_stopped(core, ctx, token, assignment, "lease_lost")
                 return
-            continue
-        except (OriginRejected, OSError):
-            continue
-        apply_control(run, core, ctx, token, body.get("control") or {})
-        if flag.outcome:
-            return
-        nxt = parse_time(body.get("lease_expires_at"))
-        if nxt is not None:
-            lease_until = nxt
+            if lease_until is not None and deadline is not None and lease_until >= deadline:
+                continue
+            timeout = 60.0
+            if lease_until is not None:
+                timeout = (lease_until - now).total_seconds()
+                if timeout <= 0:
+                    if flag.claim("lease_lost"):
+                        post_stopped(core, ctx, token, assignment, "lease_lost")
+                    return
+            try:
+                body = post_json(
+                    core,
+                    ctx,
+                    "/worker/v1/attempts/" + assignment["attempt_id"] + "/lease",
+                    {"protocol_version": 1},
+                    token,
+                    assignment.get("attempt_token", ""),
+                    timeout=timeout,
+                )
+            except ProtocolError as err:
+                if err.code == "session_closed":
+                    flag.claim("session_closed")
+                    return
+                if err.code == "attempt_not_active":
+                    if flag.claim("lease_lost"):
+                        post_stopped(core, ctx, token, assignment, "lease_lost")
+                    return
+                continue
+            except (OriginRejected, OSError):
+                if flag.outcome:
+                    return
+                if lease_until is not None and datetime.now(timezone.utc) >= lease_until:
+                    if flag.claim("lease_lost"):
+                        post_stopped(core, ctx, token, assignment, "lease_lost")
+                    return
+                continue
+            apply_control(run, core, ctx, token, body.get("control") or {})
+            if flag.outcome:
+                return
+            nxt = parse_time(body.get("lease_expires_at"))
+            if nxt is not None:
+                with state_lock:
+                    state["until"] = nxt
+                    lease_until = nxt
+    finally:
+        stop.set()
+        watcher.join(timeout=2)
 
 
 def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
@@ -316,13 +363,20 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
     with run.lock:
         run.flag = flag
         run.assignment = assignment
+        stop_now = run.terminated
+        claimed = stop_now and flag.claim("terminate")
     renewer = threading.Thread(
         target=renew_loop,
         args=(core, ctx, token, assignment, lease_seconds, run, flag, done),
         daemon=True,
     )
-    renewer.start()
+    if not stop_now:
+        renewer.start()
     try:
+        if stop_now:
+            if claimed:
+                post_stopped(core, ctx, token, assignment, "terminate")
+            return None
         if flag.outcome:
             return None
         status, png = request("GET", source["href"], context=ctx, limit=100 * 1024 * 1024)
@@ -389,7 +443,8 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
         )
     finally:
         done.set()
-        renewer.join(timeout=5)
+        if not stop_now:
+            renewer.join(timeout=5)
         with run.lock:
             if run.flag is flag:
                 run.flag = None
