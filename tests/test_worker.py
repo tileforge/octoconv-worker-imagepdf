@@ -5,12 +5,13 @@ import ssl
 import subprocess
 import threading
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 from pypdf import PdfReader
 from io import BytesIO
 
-from octoconv_worker_imagepdf.client import serve
+from octoconv_worker_imagepdf.client import Run, finish_assignment, renew_wait, serve
 from octoconv_worker_imagepdf.convert import png_to_pdf
 from octoconv_worker_imagepdf.measure import budget_seconds, measure
 from octoconv_worker_imagepdf.messages import (
@@ -20,6 +21,7 @@ from octoconv_worker_imagepdf.messages import (
     manifest_sha256,
     progress_request,
     pull_request,
+    stopped_request,
     validator,
 )
 from octoconv_worker_imagepdf.origin import OriginRejected, request, require_https
@@ -52,6 +54,7 @@ class SchemaTest(unittest.TestCase):
             progress_request(99),
             complete_request(pdf),
             fail_request("engine_error", "convert"),
+            stopped_request("terminate"),
         ]
         for body in bodies:
             check.validate(body)
@@ -222,6 +225,227 @@ class BoundaryTest(unittest.TestCase):
         self.assertGreaterEqual(seconds, 10)
         self.assertGreaterEqual(seconds, p99 * 2)
         self.assertEqual(report["pdf_bytes"] > 0, True)
+
+
+class LeaseTest(unittest.TestCase):
+    def test_renew_waits_half_until_the_lease_covers_the_deadline(self):
+        now = datetime(2026, 11, 11, tzinfo=timezone.utc)
+        self.assertEqual(
+            renew_wait(30, now + timedelta(seconds=30), now + timedelta(seconds=120), now),
+            15,
+        )
+        self.assertEqual(
+            renew_wait(30, now + timedelta(seconds=30), now + timedelta(seconds=10), now),
+            30,
+        )
+        self.assertEqual(renew_wait(30, now - timedelta(seconds=1), now + timedelta(seconds=120), now), 0)
+
+    def test_plaintext_file_url_is_not_fetched(self):
+        assignment = _assignment("http://127.0.0.1/file", "https://127.0.0.1/out")
+        with self.assertRaises(OriginRejected):
+            finish_assignment(
+                "https://core.example",
+                ssl.create_default_context(),
+                "ab" * 32,
+                assignment,
+                Run(),
+                30,
+            )
+
+    def test_open_lease_is_renewed_before_complete(self):
+        paths = self._attempt(terminate=False)
+        self.assertLess(paths.index("lease"), paths.index("complete"))
+        self.assertNotIn("stopped", paths)
+        self.assertNotIn("fail", paths)
+
+    def test_terminate_reports_stopped(self):
+        paths = self._attempt(terminate=True)
+        self.assertIn("stopped", paths)
+        self.assertNotIn("complete", paths)
+        self.assertNotIn("fail", paths)
+
+    def _attempt(self, terminate):
+        cert, key = _local_cert()
+        seen = []
+        release = threading.Event()
+        pulls = {"n": 0}
+        beats = {"n": 0}
+        now = datetime.now(timezone.utc)
+        if terminate:
+            lease_at = _stamp(now + timedelta(hours=2))
+            deadline = _stamp(now + timedelta(hours=1))
+            lease_seconds = 30
+            beat = 1
+        else:
+            lease_at = _stamp(now + timedelta(seconds=30))
+            deadline = _stamp(now + timedelta(hours=1))
+            lease_seconds = 1
+            beat = 3600
+        idle = {"cancel_attempt_ids": [], "drain": False, "terminate": False}
+        session_id = "00000000-0000-4000-8000-000000000010"
+        hello = _hello(session_id, lease_seconds, beat)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                if self.path == "/worker/v1/sessions":
+                    body = hello
+                elif self.path.endswith("/pull"):
+                    pulls["n"] += 1
+                    if pulls["n"] == 1:
+                        body = {
+                            "protocol_version": 1,
+                            "assignments": [
+                                _assignment(
+                                    f"https://127.0.0.1:{server.server_address[1]}/png",
+                                    f"https://127.0.0.1:{server.server_address[1]}/out",
+                                    lease_at,
+                                    deadline,
+                                )
+                            ],
+                            "control": idle,
+                        }
+                    else:
+                        control = dict(idle)
+                        control["drain"] = True
+                        body = {"protocol_version": 1, "assignments": [], "control": control}
+                elif self.path.endswith("/heartbeat"):
+                    beats["n"] += 1
+                    control = dict(idle)
+                    if terminate and beats["n"] == 1:
+                        control["terminate"] = True
+                    body = {"protocol_version": 1, "control": control}
+                elif self.path.endswith("/lease"):
+                    release.set()
+                    body = {
+                        "protocol_version": 1,
+                        "lease_expires_at": deadline,
+                        "attempt_deadline": deadline,
+                        "control": idle,
+                    }
+                elif self.path.endswith("/stopped"):
+                    release.set()
+                    body = {}
+                else:
+                    body = {}
+                _write(self, body)
+
+            def do_GET(self):
+                seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
+                if not release.wait(8):
+                    _write(self, {}, status=500)
+                    return
+                payload = SAMPLE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_PUT(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_DELETE(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_server.load_cert_chain(cert, key)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
+        thread = threading.Thread(target=server.serve_forever, daemon=True)
+        thread.start()
+        try:
+            port = server.server_address[1]
+            serve(
+                f"https://127.0.0.1:{port}",
+                ssl._create_unverified_context(),
+                "00000000-0000-4000-8000-000000000001",
+                "cd" * 32,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        gets = [item for item in seen if item[0] == "GET"]
+        self.assertEqual(gets[0][3], None)
+        return [item[1].rsplit("/", 1)[-1] for item in seen if item[0] != "GET"]
+
+
+def _stamp(moment):
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _hello(session_id, lease_seconds, beat):
+    return {
+        "protocol_version": 1,
+        "session_id": session_id,
+        "session_token": "ab" * 32,
+        "control": {"cancel_attempt_ids": [], "drain": False, "terminate": False},
+        "pull_wait_seconds": 0,
+        "heartbeat_interval_seconds": beat,
+        "lease_seconds": lease_seconds,
+        "session_max_lifetime_seconds": 3600,
+        "max_message_bytes": 262144,
+        "file_link_max_ttl_seconds": 300,
+        "clock_skew_margin_seconds": 5,
+        "pull_rate_per_second": 2,
+        "progress_rate_per_second": 4,
+        "file_access": "direct",
+    }
+
+
+def _assignment(source, target, lease_at=None, deadline=None):
+    moment = lease_at or "2026-11-11T12:00:30Z"
+    end = deadline or "2026-11-11T12:02:00Z"
+    return {
+        "job_id": "00000000-0000-4000-8000-000000000020",
+        "step_id": "00000000-0000-4000-8000-000000000021",
+        "attempt_id": "00000000-0000-4000-8000-000000000022",
+        "attempt_token": "cd" * 32,
+        "capability_id": "octoconv.convert.imagepdf",
+        "capability_version": 1,
+        "attempt_deadline": end,
+        "lease_expires_at": moment,
+        "limits": {"max_output_bytes": 104857600},
+        "inputs": [
+            {
+                "role": "source",
+                "ordinal": 0,
+                "format": "png",
+                "href": source,
+                "expires_at": end,
+            }
+        ],
+        "outputs": [
+            {
+                "role": "primary",
+                "ordinal": 0,
+                "format": "pdf",
+                "href": target,
+                "expires_at": end,
+            }
+        ],
+    }
+
+
+def _write(handler, body, status=200):
+    payload = json.dumps(body).encode()
+    handler.send_response(status)
+    handler.send_header("Content-Type", "application/json")
+    handler.send_header("Content-Length", str(len(payload)))
+    handler.end_headers()
+    handler.wfile.write(payload)
 
 
 def _local_cert():

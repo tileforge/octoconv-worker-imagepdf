@@ -14,7 +14,7 @@ python3 -m venv .venv
 .venv/bin/python -m octoconv_worker_imagepdf
 ```
 
-The process opens one session and pulls on it until the core says drain, then deletes that session. It heartbeats the session. It does not renew the attempt lease. The core client API still answers png to pdf with 422, and a pull for this capability still comes back empty. This process does not change that binary.
+The process opens one session and pulls on it until the core says drain, then deletes that session. It heartbeats the session. While an attempt is in hand it renews the lease until that lease covers the attempt deadline. Terminate, cancel, and a lost lease are reported as stopped. A plaintext file URL is refused before the fetch. The core client API still answers png to pdf with 422, and a pull for this capability still comes back empty. This process does not change that binary.
 
 ## Budget
 

@@ -63,6 +63,10 @@ def complete_request(pdf: bytes) -> dict:
     }
 
 
+def stopped_request(reason: str) -> dict:
+    return {"protocol_version": 1, "reason": reason}
+
+
 def fail_request(engine_code: str, message: str) -> dict:
     return {
         "protocol_version": 1,
