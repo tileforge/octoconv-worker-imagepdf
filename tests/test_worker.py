@@ -4,6 +4,7 @@ import json
 import ssl
 import subprocess
 import threading
+import time
 import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -628,6 +629,224 @@ class LeaseTest(unittest.TestCase):
         self.assertEqual(paths.count("pull"), 1)
         self.assertNotIn("complete", paths)
         self.assertNotIn(session_id, paths)
+
+    def test_pull_cancel_reports_stopped_without_fetch(self):
+        cert, key = _local_cert()
+        seen = []
+        pulls = {"n": 0}
+        now = datetime.now(timezone.utc)
+        lease_at = _stamp(now + timedelta(hours=2))
+        deadline = _stamp(now + timedelta(hours=1))
+        hello = _hello("00000000-0000-4000-8000-000000000010", 30, 3600)
+        idle = {"cancel_attempt_ids": [], "drain": False, "terminate": False}
+        attempt_id = "00000000-0000-4000-8000-000000000022"
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                if self.path == "/worker/v1/sessions":
+                    body = hello
+                elif self.path.endswith("/pull"):
+                    pulls["n"] += 1
+                    if pulls["n"] == 1:
+                        port = server.server_address[1]
+                        control = dict(idle)
+                        control["cancel_attempt_ids"] = [attempt_id]
+                        body = {
+                            "protocol_version": 1,
+                            "assignments": [
+                                _assignment(
+                                    f"https://127.0.0.1:{port}/png",
+                                    f"https://127.0.0.1:{port}/out",
+                                    lease_at,
+                                    deadline,
+                                )
+                            ],
+                            "control": control,
+                        }
+                    else:
+                        control = dict(idle)
+                        control["drain"] = True
+                        body = {"protocol_version": 1, "assignments": [], "control": control}
+                else:
+                    body = {}
+                _write(self, body)
+
+            def do_GET(self):
+                seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
+                payload = SAMPLE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_DELETE(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_server.load_cert_chain(cert, key)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            serve(
+                f"https://127.0.0.1:{server.server_address[1]}",
+                ssl._create_unverified_context(),
+                "00000000-0000-4000-8000-000000000001",
+                "cd" * 32,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        reasons = [
+            json.loads(raw)["reason"]
+            for command, path, raw, _auth in seen
+            if command == "POST" and path.endswith("/stopped")
+        ]
+        paths = [item[1].rsplit("/", 1)[-1] for item in seen if item[0] != "GET"]
+        self.assertEqual([item for item in seen if item[0] == "GET"], [])
+        self.assertEqual(reasons, ["cancel"])
+        self.assertNotIn("complete", paths)
+        self.assertNotIn("fail", paths)
+
+    def test_serve_waits_for_the_stop_report(self):
+        cert, key = _local_cert()
+        seen = []
+        started = threading.Event()
+        release = threading.Event()
+        now = datetime.now(timezone.utc)
+        lease_at = _stamp(now + timedelta(hours=2))
+        deadline = _stamp(now + timedelta(hours=1))
+        hello = _hello("00000000-0000-4000-8000-000000000010", 30, 1)
+        idle = {"cancel_attempt_ids": [], "drain": False, "terminate": False}
+        beats = {"n": 0}
+        pulls = {"n": 0}
+        holder = {}
+        original = client_mod.png_to_pdf
+
+        def blocked_convert(png, _orig=original):
+            if not started.wait(5):
+                raise AssertionError("stopped request did not start")
+            return _orig(png)
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                if self.path == "/worker/v1/sessions":
+                    body = hello
+                elif self.path.endswith("/pull"):
+                    pulls["n"] += 1
+                    if pulls["n"] == 1:
+                        port = server.server_address[1]
+                        body = {
+                            "protocol_version": 1,
+                            "assignments": [
+                                _assignment(
+                                    f"https://127.0.0.1:{port}/png",
+                                    f"https://127.0.0.1:{port}/out",
+                                    lease_at,
+                                    deadline,
+                                )
+                            ],
+                            "control": dict(idle),
+                        }
+                    else:
+                        control = dict(idle)
+                        control["drain"] = True
+                        body = {"protocol_version": 1, "assignments": [], "control": control}
+                elif self.path.endswith("/heartbeat"):
+                    beats["n"] += 1
+                    control = dict(idle)
+                    if beats["n"] == 1:
+                        control["terminate"] = True
+                    body = {"protocol_version": 1, "control": control}
+                elif self.path.endswith("/stopped"):
+                    started.set()
+                    release.wait(3)
+                    body = {}
+                elif self.path.endswith("/progress"):
+                    payload = json.loads(raw.decode() or "{}")
+                    if payload.get("percent") == 99:
+                        _write(self, {"code": "attempt_not_active"}, status=409)
+                        return
+                    body = {}
+                else:
+                    body = {}
+                _write(self, body)
+
+            def do_GET(self):
+                seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
+                payload = SAMPLE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_server.load_cert_chain(cert, key)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        client_mod.png_to_pdf = blocked_convert
+
+        def run():
+            try:
+                serve(
+                    f"https://127.0.0.1:{server.server_address[1]}",
+                    ssl._create_unverified_context(),
+                    "00000000-0000-4000-8000-000000000001",
+                    "cd" * 32,
+                )
+            except Exception as exc:
+                holder["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        try:
+            self.assertTrue(started.wait(5))
+            deadline_at = time.monotonic() + 1
+            while time.monotonic() < deadline_at:
+                if not worker.is_alive():
+                    self.fail("serve returned before /stopped finished")
+                time.sleep(0.05)
+            release.set()
+            worker.join(4)
+        finally:
+            release.set()
+            client_mod.png_to_pdf = original
+            server.shutdown()
+            server.server_close()
+            worker.join(2)
+        self.assertFalse(worker.is_alive())
+        self.assertNotIn("error", holder)
+        reasons = [
+            json.loads(raw)["reason"]
+            for command, path, raw, _auth in seen
+            if command == "POST" and path.endswith("/stopped")
+        ]
+        paths = [item[1].rsplit("/", 1)[-1] for item in seen]
+        self.assertEqual(reasons, ["terminate"])
+        self.assertNotIn("complete", paths)
 
     def _attempt(self, terminate, lease_drain=False, cancel=False):
         cert, key = _local_cert()

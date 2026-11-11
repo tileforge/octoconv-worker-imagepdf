@@ -52,6 +52,8 @@ class Run:
         self.assignment = None
         self.draining = False
         self.terminated = False
+        self.pending_stops = 0
+        self.stopped_idle = threading.Condition(self.lock)
 
 
 def parse_time(raw):
@@ -156,6 +158,31 @@ def post_stopped(core, ctx, token, assignment, reason):
         return
 
 
+def finish_stop(run):
+    with run.lock:
+        run.pending_stops -= 1
+        if run.pending_stops == 0:
+            run.stopped_idle.notify_all()
+
+
+def track_stop(run, flag, outcome, core, ctx, token, assignment, reason):
+    with run.lock:
+        if not flag.claim(outcome):
+            return False
+        run.pending_stops += 1
+    try:
+        post_stopped(core, ctx, token, assignment, reason)
+    finally:
+        finish_stop(run)
+    return True
+
+
+def wait_stops(run):
+    with run.lock:
+        while run.pending_stops:
+            run.stopped_idle.wait()
+
+
 def apply_control(run, core, ctx, token, control):
     if control.get("drain"):
         with run.lock:
@@ -169,13 +196,11 @@ def apply_control(run, core, ctx, token, control):
     if flag is None or assignment is None:
         return
     if control.get("terminate"):
-        if flag.claim("terminate"):
-            post_stopped(core, ctx, token, assignment, "terminate")
+        track_stop(run, flag, "terminate", core, ctx, token, assignment, "terminate")
         return
     attempt_id = assignment.get("attempt_id")
     if attempt_id and attempt_id in (control.get("cancel_attempt_ids") or []):
-        if flag.claim("cancel"):
-            post_stopped(core, ctx, token, assignment, "cancel")
+        track_stop(run, flag, "cancel", core, ctx, token, assignment, "cancel")
 
 
 def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
@@ -199,8 +224,7 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
                 until = state["until"]
             if stop.is_set() or until is None or datetime.now(timezone.utc) < until:
                 continue
-            if flag.claim("lease_lost"):
-                post_stopped(core, ctx, token, assignment, "lease_lost")
+            track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
             return
 
     watcher = threading.Thread(target=expire, daemon=True)
@@ -214,8 +238,7 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
                 return
             now = datetime.now(timezone.utc)
             if lease_until is not None and now >= lease_until:
-                if flag.claim("lease_lost"):
-                    post_stopped(core, ctx, token, assignment, "lease_lost")
+                track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
                 return
             if lease_until is not None and deadline is not None and lease_until >= deadline:
                 continue
@@ -223,8 +246,7 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
             if lease_until is not None:
                 timeout = (lease_until - now).total_seconds()
                 if timeout <= 0:
-                    if flag.claim("lease_lost"):
-                        post_stopped(core, ctx, token, assignment, "lease_lost")
+                    track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
                     return
             try:
                 body = post_json(
@@ -241,16 +263,14 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
                     flag.claim("session_closed")
                     return
                 if err.code == "attempt_not_active":
-                    if flag.claim("lease_lost"):
-                        post_stopped(core, ctx, token, assignment, "lease_lost")
+                    track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
                     return
                 continue
             except (OriginRejected, OSError):
                 if flag.outcome:
                     return
                 if lease_until is not None and datetime.now(timezone.utc) >= lease_until:
-                    if flag.claim("lease_lost"):
-                        post_stopped(core, ctx, token, assignment, "lease_lost")
+                    track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
                     return
                 continue
             apply_control(run, core, ctx, token, body.get("control") or {})
@@ -298,7 +318,8 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
                 return
             apply_control(run, core, ctx, token, body.get("control") or {})
 
-    threading.Thread(target=beat, daemon=True).start()
+    beat_thread = threading.Thread(target=beat, daemon=True)
+    beat_thread.start()
     try:
         control = hello.get("control") or {}
         apply_control(run, core, ctx, token, control)
@@ -321,9 +342,9 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
                 token,
             )
             control = pull.get("control") or {}
-            apply_control(run, core, ctx, token, control)
             assignments = pull.get("assignments") or []
             if not assignments:
+                apply_control(run, core, ctx, token, control)
                 if control.get("terminate") or run.terminated:
                     return None
                 if control.get("drain") or run.draining:
@@ -331,7 +352,9 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
                     return None
                 time.sleep(0.2)
                 continue
-            result = finish_assignment(core, ctx, token, assignments[0], run, lease_seconds)
+            result = finish_assignment(
+                core, ctx, token, assignments[0], run, lease_seconds, control
+            )
             if control.get("terminate") or run.terminated:
                 return result
             if control.get("drain") or run.draining:
@@ -339,9 +362,11 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
                 return result
     finally:
         stop.set()
+        wait_stops(run)
+        beat_thread.join(timeout=5)
 
 
-def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
+def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=None):
     if assignment.get("capability_id") != CAPABILITY_ID:
         return fail(core, ctx, token, assignment, "engine_error", "capability")
     inputs = assignment.get("inputs") or []
@@ -364,19 +389,29 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
         run.flag = flag
         run.assignment = assignment
         stop_now = run.terminated
-        claimed = stop_now and flag.claim("terminate")
+        claimed = False
+        if stop_now and flag.claim("terminate"):
+            run.pending_stops += 1
+            claimed = True
     renewer = threading.Thread(
         target=renew_loop,
         args=(core, ctx, token, assignment, lease_seconds, run, flag, done),
         daemon=True,
     )
-    if not stop_now:
-        renewer.start()
+    started = False
     try:
         if stop_now:
             if claimed:
-                post_stopped(core, ctx, token, assignment, "terminate")
+                try:
+                    post_stopped(core, ctx, token, assignment, "terminate")
+                finally:
+                    finish_stop(run)
             return None
+        apply_control(run, core, ctx, token, control or {})
+        if flag.outcome:
+            return None
+        renewer.start()
+        started = True
         if flag.outcome:
             return None
         status, png = request("GET", source["href"], context=ctx, limit=100 * 1024 * 1024)
@@ -443,7 +478,7 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
         )
     finally:
         done.set()
-        if not stop_now:
+        if started:
             renewer.join(timeout=5)
         with run.lock:
             if run.flag is flag:
