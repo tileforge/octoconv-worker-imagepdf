@@ -381,22 +381,22 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
 
 
 def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=None):
+    flag = StopFlag()
     if assignment.get("capability_id") != CAPABILITY_ID:
-        return fail(core, ctx, token, assignment, "engine_error", "capability")
+        return fail(core, ctx, token, assignment, run, flag, "engine_error", "capability")
     inputs = assignment.get("inputs") or []
     outputs = assignment.get("outputs") or []
     if len(inputs) != 1 or len(outputs) != 1:
-        return fail(core, ctx, token, assignment, "engine_error", "assignment")
+        return fail(core, ctx, token, assignment, run, flag, "engine_error", "assignment")
     source = inputs[0]
     target = outputs[0]
     if source.get("format") != "png" or target.get("format") != "pdf":
-        return fail(core, ctx, token, assignment, "engine_error", "format")
+        return fail(core, ctx, token, assignment, run, flag, "engine_error", "format")
     require_https(source["href"])
     require_https(target["href"])
     if parse_time(assignment.get("attempt_deadline")) is None or parse_time(assignment.get("lease_expires_at")) is None:
-        return fail(core, ctx, token, assignment, "engine_error", "assignment")
+        return fail(core, ctx, token, assignment, run, flag, "engine_error", "assignment")
     attempt_id = assignment["attempt_id"]
-    flag = StopFlag()
     done = threading.Event()
     with run.lock:
         run.flag = flag
@@ -431,7 +431,7 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
         if flag.outcome:
             return None
         if status < 200 or status >= 300:
-            return fail(core, ctx, token, assignment, "engine_error", "input")
+            return fail(core, ctx, token, assignment, run, flag, "engine_error", "input")
         if post_attempt(
             core,
             ctx,
@@ -443,19 +443,21 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
             progress_request(0),
         ) is None:
             return None
+        if flag.outcome:
+            return None
         try:
             pdf = png_to_pdf(png)
         except (ValueError, img2pdf_error()):
             if flag.outcome:
                 return None
-            return fail(core, ctx, token, assignment, "engine_error", "convert")
+            return fail(core, ctx, token, assignment, run, flag, "engine_error", "convert")
         if flag.outcome:
             return None
         limit = int((assignment.get("limits") or {}).get("max_output_bytes") or 0)
         if limit and len(pdf) > limit:
             if flag.outcome:
                 return None
-            return fail(core, ctx, token, assignment, "engine_error", "output too large")
+            return fail(core, ctx, token, assignment, run, flag, "engine_error", "output too large")
         if flag.outcome:
             return None
         if post_attempt(
@@ -469,6 +471,8 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
             progress_request(99),
         ) is None:
             return None
+        if flag.outcome:
+            return None
         put_status, _ = request(
             "PUT",
             target["href"],
@@ -480,7 +484,7 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds, control=
         if flag.outcome:
             return None
         if put_status < 200 or put_status >= 300:
-            return fail(core, ctx, token, assignment, "engine_error", "output")
+            return fail(core, ctx, token, assignment, run, flag, "engine_error", "output")
         result = post_attempt(
             core,
             ctx,
@@ -530,14 +534,16 @@ def post_attempt(core, ctx, token, assignment, run, flag, path, body):
         raise
 
 
-def fail(core, ctx, token, assignment, engine_code, message):
-    return post_json(
+def fail(core, ctx, token, assignment, run, flag, engine_code, message):
+    return post_attempt(
         core,
         ctx,
+        token,
+        assignment,
+        run,
+        flag,
         "/worker/v1/attempts/" + assignment["attempt_id"] + "/fail",
         fail_request(engine_code, message),
-        token,
-        assignment.get("attempt_token", ""),
     )
 
 
