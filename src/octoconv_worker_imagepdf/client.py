@@ -53,6 +53,7 @@ class Run:
         self.draining = False
         self.terminated = False
         self.pending_stops = 0
+        self.pending_cancels = set()
         self.stopped_idle = threading.Condition(self.lock)
 
 
@@ -190,17 +191,24 @@ def apply_control(run, core, ctx, token, control):
     if control.get("terminate"):
         with run.lock:
             run.terminated = True
+    incoming = [
+        item for item in (control.get("cancel_attempt_ids") or []) if isinstance(item, str) and item
+    ]
     with run.lock:
+        run.pending_cancels.update(incoming)
         flag = run.flag
         assignment = run.assignment
+        pending = set(run.pending_cancels)
     if flag is None or assignment is None:
         return
     if control.get("terminate"):
         track_stop(run, flag, "terminate", core, ctx, token, assignment, "terminate")
         return
     attempt_id = assignment.get("attempt_id")
-    if attempt_id and attempt_id in (control.get("cancel_attempt_ids") or []):
+    if attempt_id and attempt_id in pending:
         track_stop(run, flag, "cancel", core, ctx, token, assignment, "cancel")
+        with run.lock:
+            run.pending_cancels.discard(attempt_id)
 
 
 def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
@@ -333,6 +341,9 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
             wait = 1
         while True:
             if run.terminated:
+                return None
+            if run.draining:
+                delete_session(core, ctx, session, token)
                 return None
             pull = post_json(
                 core,
