@@ -1,0 +1,411 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:octoconv:worker-protocol:v1",
+  "title": "OctoConv Worker Protocol v1",
+  "oneOf": [
+    { "$ref": "#/$defs/helloRequest" },
+    { "$ref": "#/$defs/helloResponse" },
+    { "$ref": "#/$defs/manifest" },
+    { "$ref": "#/$defs/pullRequest" },
+    { "$ref": "#/$defs/pullAssignmentResponse" },
+    { "$ref": "#/$defs/completeRequest" },
+    { "$ref": "#/$defs/protocolOnlyRequest" },
+    { "$ref": "#/$defs/heartbeatResponse" },
+    { "$ref": "#/$defs/leaseResponse" },
+    { "$ref": "#/$defs/progressRequest" },
+    { "$ref": "#/$defs/failRequest" },
+    { "$ref": "#/$defs/stoppedRequest" },
+    { "$ref": "#/$defs/error" }
+  ],
+  "$defs": {
+    "extensions": {
+      "type": "object",
+      "additionalProperties": true
+    },
+    "helloRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "worker_id", "manifest_sha256", "free_slots"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "worker_id": { "type": "string", "format": "uuid" },
+        "manifest_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "free_slots": { "type": "integer", "minimum": 0 },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "helloResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "protocol_version",
+        "session_id",
+        "session_token",
+        "control",
+        "pull_wait_seconds",
+        "heartbeat_interval_seconds",
+        "lease_seconds",
+        "session_max_lifetime_seconds",
+        "max_message_bytes",
+        "file_link_max_ttl_seconds",
+        "clock_skew_margin_seconds",
+        "pull_rate_per_second",
+        "progress_rate_per_second",
+        "file_access"
+      ],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "session_id": { "type": "string", "format": "uuid" },
+        "session_token": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "pull_wait_seconds": { "type": "integer", "minimum": 0 },
+        "heartbeat_interval_seconds": { "type": "integer", "minimum": 1 },
+        "lease_seconds": { "type": "integer", "minimum": 1 },
+        "session_max_lifetime_seconds": { "type": "integer", "minimum": 1 },
+        "max_message_bytes": { "type": "integer", "minimum": 1 },
+        "file_link_max_ttl_seconds": { "type": "integer", "minimum": 1, "maximum": 604800 },
+        "clock_skew_margin_seconds": { "type": "integer", "minimum": 0 },
+        "pull_rate_per_second": { "type": "integer", "minimum": 1 },
+        "progress_rate_per_second": { "type": "integer", "minimum": 1 },
+        "file_access": { "type": "string", "enum": ["direct", "gateway"] },
+        "control": { "$ref": "#/$defs/control" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "pullRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "pull_request_id", "free_slots", "wait_seconds"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "pull_request_id": { "type": "string", "format": "uuid" },
+        "free_slots": { "type": "integer", "minimum": 0 },
+        "wait_seconds": { "type": "integer" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "pullAssignmentResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "assignments", "control"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "assignments": {
+          "type": "array",
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/assignment" }
+        },
+        "control": { "$ref": "#/$defs/control" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "completeRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "artifacts"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "artifacts": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/artifact" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "protocolOnlyRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "heartbeatResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "control"],
+      "not": {
+        "anyOf": [
+          { "required": ["assignments"] },
+          { "required": ["session_id"] },
+          { "required": ["lease_expires_at"] }
+        ]
+      },
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "control": { "$ref": "#/$defs/control" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "leaseResponse": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "lease_expires_at", "attempt_deadline", "control"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "lease_expires_at": { "type": "string", "format": "date-time" },
+        "attempt_deadline": { "type": "string", "format": "date-time" },
+        "control": { "$ref": "#/$defs/control" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "progressRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "percent"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "percent": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0, "maximum": 99 },
+            { "type": "null" }
+          ]
+        },
+        "stage": { "type": "string", "minLength": 1 },
+        "stage_index": { "type": "integer", "minimum": 1 },
+        "stage_count": { "type": "integer", "minimum": 1 },
+        "eta_seconds": {
+          "oneOf": [
+            { "type": "integer", "minimum": 0 },
+            { "type": "null" }
+          ]
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "failRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "engine_code", "message"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "engine_code": { "type": "string", "minLength": 1 },
+        "message": { "type": "string", "minLength": 1 },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "stoppedRequest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["protocol_version", "reason"],
+      "properties": {
+        "protocol_version": { "const": 1 },
+        "reason": { "type": "string", "enum": ["cancel", "terminate", "lease_lost"] },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "error": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["code", "message", "retryable"],
+      "properties": {
+        "code": {
+          "type": "string",
+          "enum": [
+            "unauthorized",
+            "session_closed",
+            "manifest_mismatch",
+            "capability_denied",
+            "incompatible_protocol",
+            "invalid_message",
+            "unknown_field",
+            "invalid_progress",
+            "message_too_large",
+            "rate_limited",
+            "pull_conflict",
+            "complete_conflict",
+            "attempt_not_active",
+            "artifact_rejected"
+          ]
+        },
+        "message": { "type": "string", "minLength": 1 },
+        "retryable": { "type": "boolean" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "control": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["cancel_attempt_ids", "drain", "terminate"],
+      "properties": {
+        "cancel_attempt_ids": {
+          "type": "array",
+          "items": { "type": "string", "format": "uuid" }
+        },
+        "drain": { "type": "boolean" },
+        "terminate": { "type": "boolean" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "assignment": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "job_id",
+        "step_id",
+        "attempt_id",
+        "attempt_token",
+        "capability_id",
+        "capability_version",
+        "attempt_deadline",
+        "lease_expires_at",
+        "limits",
+        "inputs",
+        "outputs"
+      ],
+      "properties": {
+        "job_id": { "type": "string", "format": "uuid" },
+        "step_id": { "type": "string", "format": "uuid" },
+        "attempt_id": { "type": "string", "format": "uuid" },
+        "attempt_token": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "capability_id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$"
+        },
+        "capability_version": { "type": "integer", "minimum": 1 },
+        "attempt_deadline": { "type": "string", "format": "date-time" },
+        "lease_expires_at": { "type": "string", "format": "date-time" },
+        "limits": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["max_output_bytes"],
+          "properties": {
+            "max_output_bytes": { "type": "integer", "minimum": 0 },
+            "extensions": { "$ref": "#/$defs/extensions" }
+          }
+        },
+        "inputs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fileLink" }
+        },
+        "outputs": {
+          "type": "array",
+          "items": { "$ref": "#/$defs/fileLink" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "fileLink": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "ordinal", "format", "href", "expires_at"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["source", "primary", "report", "preview", "thumbnail", "measurements"]
+        },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "format": { "type": "string", "minLength": 1 },
+        "href": { "type": "string", "format": "uri" },
+        "expires_at": { "type": "string", "format": "date-time" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "artifact": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["role", "ordinal", "format", "byte_size", "content_type", "sha256"],
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["primary", "report", "preview", "thumbnail", "measurements"]
+        },
+        "ordinal": { "type": "integer", "minimum": 0 },
+        "format": { "type": "string", "minLength": 1 },
+        "byte_size": { "type": "integer", "minimum": 0 },
+        "content_type": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "manifest": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["capabilities"],
+      "properties": {
+        "capabilities": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 1,
+          "items": { "$ref": "#/$defs/capability" }
+        },
+        "extensions": { "$ref": "#/$defs/extensions" }
+      }
+    },
+    "capability": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["id", "version", "client_operation", "inputs", "outputs", "parameter_schema", "formats"],
+      "properties": {
+        "id": {
+          "type": "string",
+          "maxLength": 128,
+          "pattern": "^[a-z][a-z0-9]*(\\.[a-z][a-z0-9]*)+$"
+        },
+        "version": { "type": "integer", "minimum": 1 },
+        "legacy": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["operation", "engine"],
+          "properties": {
+            "operation": { "type": "string", "minLength": 1 },
+            "engine": {
+              "type": "string",
+              "enum": ["image", "document", "av", "cad", "archive", "probe", "html", "audio", "ocr", "pandoc", "tectonic"]
+            }
+          }
+        },
+        "client_operation": { "type": "string", "minLength": 1 },
+        "inputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "min", "max"],
+            "properties": {
+              "role": { "type": "string", "enum": ["source"] },
+              "min": { "type": "integer", "minimum": 0 },
+              "max": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "outputs": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["role", "min", "max"],
+            "properties": {
+              "role": {
+                "type": "string",
+                "enum": ["primary", "report", "preview", "thumbnail", "measurements"]
+              },
+              "min": { "type": "integer", "minimum": 0 },
+              "max": { "type": "integer", "minimum": 0 }
+            }
+          }
+        },
+        "parameter_schema": {
+          "type": "object",
+          "additionalProperties": true
+        },
+        "formats": {
+          "type": "array",
+          "minItems": 1,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["from", "to"],
+            "properties": {
+              "from": { "type": "string", "minLength": 1 },
+              "to": { "type": "string", "minLength": 1 }
+            }
+          }
+        }
+      }
+    }
+  }
+}

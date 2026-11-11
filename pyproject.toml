@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "octoconv-worker-imagepdf"
+version = "0.1.0"
+description = "Outbound Worker Protocol v1 client that converts one PNG to one PDF."
+requires-python = ">=3.11"
+dependencies = [
+  "img2pdf>=0.5.1",
+  "jsonschema>=4.23",
+  "pypdf>=5.1",
+]
+
+[tool.setuptools.packages.find]
+where = ["src"]
