@@ -1,5 +1,6 @@
 """Dial the core, pull one assignment, and put back one PDF."""
 
+import http.client
 import json
 import os
 import ssl
@@ -79,9 +80,11 @@ def renew_wait(lease_seconds, lease_until, deadline, now):
     if lease_until is None:
         return half
     remaining = (lease_until - now).total_seconds()
-    if remaining < 0:
+    if remaining <= 0:
         return 0.0
-    return min(half, remaining)
+    if half < remaining:
+        return half
+    return remaining / 2
 
 
 def core_context():
@@ -274,7 +277,7 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
                     track_stop(run, flag, "lease_lost", core, ctx, token, assignment, "lease_lost")
                     return
                 continue
-            except (OriginRejected, OSError):
+            except (OriginRejected, OSError, http.client.HTTPException, json.JSONDecodeError):
                 if flag.outcome:
                     return
                 if lease_until is not None and datetime.now(timezone.utc) >= lease_until:

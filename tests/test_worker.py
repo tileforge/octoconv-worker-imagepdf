@@ -241,6 +241,14 @@ class LeaseTest(unittest.TestCase):
             30,
         )
         self.assertEqual(renew_wait(30, now - timedelta(seconds=1), now + timedelta(seconds=120), now), 0)
+        self.assertEqual(
+            renew_wait(30, now + timedelta(seconds=10), now + timedelta(seconds=120), now),
+            5,
+        )
+        self.assertEqual(
+            renew_wait(30, now + timedelta(seconds=14), now + timedelta(seconds=120), now),
+            7,
+        )
 
     def test_plaintext_file_url_is_not_fetched(self):
         assignment = _assignment("http://127.0.0.1/file", "https://127.0.0.1/out")
@@ -1068,6 +1076,215 @@ class LeaseTest(unittest.TestCase):
         self.assertEqual(reasons, ["cancel"])
         self.assertNotIn("complete", paths)
         self.assertGreaterEqual(beats["n"], 1)
+
+    def test_short_lease_is_renewed_before_expiry(self):
+        cert, key = _local_cert()
+        seen = []
+        release = threading.Event()
+        pulls = {"n": 0}
+        now = datetime.now(timezone.utc)
+        lease_at = _stamp(now + timedelta(seconds=6))
+        deadline = _stamp(now + timedelta(hours=1))
+        hello = _hello("00000000-0000-4000-8000-000000000010", 30, 3600)
+        idle = {"cancel_attempt_ids": [], "drain": False, "terminate": False}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                if self.path == "/worker/v1/sessions":
+                    body = hello
+                elif self.path.endswith("/pull"):
+                    pulls["n"] += 1
+                    if pulls["n"] == 1:
+                        port = server.server_address[1]
+                        body = {
+                            "protocol_version": 1,
+                            "assignments": [
+                                _assignment(
+                                    f"https://127.0.0.1:{port}/png",
+                                    f"https://127.0.0.1:{port}/out",
+                                    lease_at,
+                                    deadline,
+                                )
+                            ],
+                            "control": dict(idle),
+                        }
+                    else:
+                        control = dict(idle)
+                        control["drain"] = True
+                        body = {"protocol_version": 1, "assignments": [], "control": control}
+                elif self.path.endswith("/lease"):
+                    release.set()
+                    body = {
+                        "protocol_version": 1,
+                        "lease_expires_at": deadline,
+                        "control": dict(idle),
+                    }
+                else:
+                    body = {}
+                _write(self, body)
+
+            def do_GET(self):
+                seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
+                if not release.wait(8):
+                    _write(self, {}, status=500)
+                    return
+                payload = SAMPLE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, b"", None))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_DELETE(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, b"", None))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_server.load_cert_chain(cert, key)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            serve(
+                f"https://127.0.0.1:{server.server_address[1]}",
+                ssl._create_unverified_context(),
+                "00000000-0000-4000-8000-000000000001",
+                "cd" * 32,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        paths = [item[1].rsplit("/", 1)[-1] for item in seen if item[0] != "GET"]
+        self.assertIn("lease", paths)
+        self.assertIn("complete", paths)
+        self.assertNotIn("stopped", paths)
+        self.assertLess(paths.index("lease"), paths.index("complete"))
+
+    def test_truncated_lease_response_is_retried(self):
+        cert, key = _local_cert()
+        seen = []
+        release = threading.Event()
+        pulls = {"n": 0}
+        leases = {"n": 0}
+        now = datetime.now(timezone.utc)
+        lease_at = _stamp(now + timedelta(seconds=30))
+        deadline = _stamp(now + timedelta(hours=1))
+        hello = _hello("00000000-0000-4000-8000-000000000010", 2, 3600)
+        idle = {"cancel_attempt_ids": [], "drain": False, "terminate": False}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            protocol_version = "HTTP/1.1"
+
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                if self.path == "/worker/v1/sessions":
+                    body = hello
+                elif self.path.endswith("/pull"):
+                    pulls["n"] += 1
+                    if pulls["n"] == 1:
+                        port = server.server_address[1]
+                        body = {
+                            "protocol_version": 1,
+                            "assignments": [
+                                _assignment(
+                                    f"https://127.0.0.1:{port}/png",
+                                    f"https://127.0.0.1:{port}/out",
+                                    lease_at,
+                                    deadline,
+                                )
+                            ],
+                            "control": dict(idle),
+                        }
+                    else:
+                        control = dict(idle)
+                        control["drain"] = True
+                        body = {"protocol_version": 1, "assignments": [], "control": control}
+                elif self.path.endswith("/lease"):
+                    leases["n"] += 1
+                    if leases["n"] == 1:
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/json")
+                        self.send_header("Transfer-Encoding", "chunked")
+                        self.end_headers()
+                        self.wfile.write(b"10\r\n")
+                        self.wfile.write(b"abcd")
+                        self.close_connection = True
+                        return
+                    release.set()
+                    body = {
+                        "protocol_version": 1,
+                        "lease_expires_at": deadline,
+                        "control": dict(idle),
+                    }
+                else:
+                    body = {}
+                _write(self, body)
+
+            def do_GET(self):
+                seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
+                if not release.wait(8):
+                    _write(self, {}, status=500)
+                    return
+                payload = SAMPLE.read_bytes()
+                self.send_response(200)
+                self.send_header("Content-Type", "image/png")
+                self.send_header("Content-Length", str(len(payload)))
+                self.end_headers()
+                self.wfile.write(payload)
+
+            def do_PUT(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, b"", None))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def do_DELETE(self):
+                self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, b"", None))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_server.load_cert_chain(cert, key)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+        try:
+            serve(
+                f"https://127.0.0.1:{server.server_address[1]}",
+                ssl._create_unverified_context(),
+                "00000000-0000-4000-8000-000000000001",
+                "cd" * 32,
+            )
+        finally:
+            server.shutdown()
+            server.server_close()
+        paths = [item[1].rsplit("/", 1)[-1] for item in seen if item[0] != "GET"]
+        self.assertGreaterEqual(leases["n"], 2)
+        self.assertIn("complete", paths)
+        self.assertNotIn("stopped", paths)
+        self.assertLess(paths.index("lease"), paths.index("complete"))
 
     def _attempt(self, terminate, lease_drain=False, cancel=False):
         cert, key = _local_cert()
