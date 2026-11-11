@@ -51,6 +51,7 @@ class Run:
         self.flag = None
         self.assignment = None
         self.draining = False
+        self.terminated = False
 
 
 def parse_time(raw):
@@ -158,6 +159,9 @@ def apply_control(run, core, ctx, token, control):
     if control.get("drain"):
         with run.lock:
             run.draining = True
+    if control.get("terminate"):
+        with run.lock:
+            run.terminated = True
     with run.lock:
         flag = run.flag
         assignment = run.assignment
@@ -173,7 +177,7 @@ def apply_control(run, core, ctx, token, control):
             post_stopped(core, ctx, token, assignment, "cancel")
 
 
-def renew_loop(core, ctx, token, assignment, lease_seconds, flag, done):
+def renew_loop(core, ctx, token, assignment, lease_seconds, run, flag, done):
     lease_until = parse_time(assignment.get("lease_expires_at"))
     deadline = parse_time(assignment.get("attempt_deadline"))
     while not done.is_set():
@@ -207,14 +211,8 @@ def renew_loop(core, ctx, token, assignment, lease_seconds, flag, done):
             continue
         except (OriginRejected, OSError):
             continue
-        control = body.get("control") or {}
-        if control.get("terminate"):
-            if flag.claim("terminate"):
-                post_stopped(core, ctx, token, assignment, "terminate")
-            return
-        if assignment.get("attempt_id") in (control.get("cancel_attempt_ids") or []):
-            if flag.claim("cancel"):
-                post_stopped(core, ctx, token, assignment, "cancel")
+        apply_control(run, core, ctx, token, body.get("control") or {})
+        if flag.outcome:
             return
         nxt = parse_time(body.get("lease_expires_at"))
         if nxt is not None:
@@ -266,6 +264,8 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
         if not isinstance(wait, int):
             wait = 1
         while True:
+            if run.terminated:
+                return None
             pull = post_json(
                 core,
                 ctx,
@@ -277,7 +277,7 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
             apply_control(run, core, ctx, token, control)
             assignments = pull.get("assignments") or []
             if not assignments:
-                if control.get("terminate"):
+                if control.get("terminate") or run.terminated:
                     return None
                 if control.get("drain") or run.draining:
                     delete_session(core, ctx, session, token)
@@ -285,7 +285,7 @@ def serve(core, ctx, worker_id, manifest_sha, free_slots=1):
                 time.sleep(0.2)
                 continue
             result = finish_assignment(core, ctx, token, assignments[0], run, lease_seconds)
-            if control.get("terminate"):
+            if control.get("terminate") or run.terminated:
                 return result
             if control.get("drain") or run.draining:
                 delete_session(core, ctx, session, token)
@@ -318,7 +318,7 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
         run.assignment = assignment
     renewer = threading.Thread(
         target=renew_loop,
-        args=(core, ctx, token, assignment, lease_seconds, flag, done),
+        args=(core, ctx, token, assignment, lease_seconds, run, flag, done),
         daemon=True,
     )
     renewer.start()
@@ -346,11 +346,15 @@ def finish_assignment(core, ctx, token, assignment, run, lease_seconds):
             if flag.outcome:
                 return None
             return fail(core, ctx, token, assignment, "engine_error", "convert")
+        if flag.outcome:
+            return None
         limit = int((assignment.get("limits") or {}).get("max_output_bytes") or 0)
         if limit and len(pdf) > limit:
             if flag.outcome:
                 return None
             return fail(core, ctx, token, assignment, "engine_error", "output too large")
+        if flag.outcome:
+            return None
         post_json(
             core,
             ctx,

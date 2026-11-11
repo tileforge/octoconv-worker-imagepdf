@@ -11,6 +11,7 @@ from pathlib import Path
 from pypdf import PdfReader
 from io import BytesIO
 
+import octoconv_worker_imagepdf.client as client_mod
 from octoconv_worker_imagepdf.client import Run, finish_assignment, renew_wait, serve
 from octoconv_worker_imagepdf.convert import png_to_pdf
 from octoconv_worker_imagepdf.measure import budget_seconds, measure
@@ -263,15 +264,126 @@ class LeaseTest(unittest.TestCase):
         self.assertIn("stopped", paths)
         self.assertNotIn("complete", paths)
         self.assertNotIn("fail", paths)
+        self.assertEqual(paths.count("pull"), 1)
+        self.assertNotIn("00000000-0000-4000-8000-000000000010", paths)
 
-    def _attempt(self, terminate):
+    def test_lease_drain_deletes_without_another_pull(self):
+        applied = threading.Event()
+        real_apply = client_mod.apply_control
+        real_convert = client_mod.png_to_pdf
+
+        def wrapped_apply(run, core, ctx, token, control):
+            real_apply(run, core, ctx, token, control)
+            if control.get("drain"):
+                applied.set()
+
+        def blocked_convert(png):
+            if not applied.wait(8):
+                raise AssertionError("lease drain was not applied")
+            return real_convert(png)
+
+        client_mod.apply_control = wrapped_apply
+        client_mod.png_to_pdf = blocked_convert
+        try:
+            paths = self._attempt(terminate=False, lease_drain=True)
+        finally:
+            client_mod.apply_control = real_apply
+            client_mod.png_to_pdf = real_convert
+        self.assertLess(paths.index("lease"), paths.index("complete"))
+        self.assertEqual(paths.count("pull"), 1)
+        self.assertIn("00000000-0000-4000-8000-000000000010", paths)
+        self.assertNotIn("stopped", paths)
+        self.assertNotIn("fail", paths)
+
+    def test_cancel_during_convert_skips_later_progress(self):
+        paths = self._attempt(terminate=False, cancel=True)
+        progress = [
+            json.loads(raw)["percent"]
+            for command, path, raw, _auth in self.seen
+            if command == "POST" and path.endswith("/progress")
+        ]
+        self.assertEqual(progress, [0])
+        self.assertIn("stopped", paths)
+        self.assertNotIn("complete", paths)
+        self.assertNotIn("fail", paths)
+
+    def test_idle_terminate_stops_the_pull_loop(self):
+        cert, key = _local_cert()
+        seen = []
+        beats = {"n": 0}
+        session_id = "00000000-0000-4000-8000-000000000010"
+        hello = _hello(session_id, 30, 1)
+        idle = {"cancel_attempt_ids": [], "drain": False, "terminate": False}
+        holder = {}
+
+        class Handler(http.server.BaseHTTPRequestHandler):
+            def do_POST(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                if self.path == "/worker/v1/sessions":
+                    body = hello
+                elif self.path.endswith("/pull"):
+                    body = {"protocol_version": 1, "assignments": [], "control": dict(idle)}
+                elif self.path.endswith("/heartbeat"):
+                    beats["n"] += 1
+                    control = dict(idle)
+                    if beats["n"] == 1:
+                        control["terminate"] = True
+                    body = {"protocol_version": 1, "control": control}
+                else:
+                    body = {}
+                _write(self, body)
+
+            def do_DELETE(self):
+                raw = self.rfile.read(int(self.headers.get("Content-Length") or 0))
+                seen.append((self.command, self.path, raw, self.headers.get("Authorization")))
+                self.send_response(200)
+                self.send_header("Content-Length", "0")
+                self.end_headers()
+
+            def log_message(self, fmt, *args):
+                return
+
+        ctx_server = ssl.SSLContext(ssl.PROTOCOL_TLS_SERVER)
+        ctx_server.load_cert_chain(cert, key)
+        server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
+        server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
+        threading.Thread(target=server.serve_forever, daemon=True).start()
+
+        def run():
+            try:
+                serve(
+                    f"https://127.0.0.1:{server.server_address[1]}",
+                    ssl._create_unverified_context(),
+                    "00000000-0000-4000-8000-000000000001",
+                    "cd" * 32,
+                )
+            except Exception as exc:
+                holder["error"] = exc
+
+        worker = threading.Thread(target=run, daemon=True)
+        worker.start()
+        worker.join(5)
+        alive = worker.is_alive()
+        server.shutdown()
+        server.server_close()
+        worker.join(2)
+        self.assertFalse(alive)
+        self.assertNotIn("error", holder)
+        paths = [item[1].rsplit("/", 1)[-1] for item in seen if item[0] != "GET"]
+        self.assertGreaterEqual(beats["n"], 1)
+        self.assertGreaterEqual(paths.count("pull"), 1)
+        self.assertNotIn(session_id, paths)
+        self.assertNotIn("stopped", paths)
+
+    def _attempt(self, terminate, lease_drain=False, cancel=False):
         cert, key = _local_cert()
         seen = []
         release = threading.Event()
         pulls = {"n": 0}
         beats = {"n": 0}
         now = datetime.now(timezone.utc)
-        if terminate:
+        if terminate or cancel:
             lease_at = _stamp(now + timedelta(hours=2))
             deadline = _stamp(now + timedelta(hours=1))
             lease_seconds = 30
@@ -315,14 +427,25 @@ class LeaseTest(unittest.TestCase):
                     control = dict(idle)
                     if terminate and beats["n"] == 1:
                         control["terminate"] = True
+                    if cancel and beats["n"] == 1:
+                        control["cancel_attempt_ids"] = ["00000000-0000-4000-8000-000000000022"]
                     body = {"protocol_version": 1, "control": control}
+                elif self.path.endswith("/progress"):
+                    payload = json.loads(raw.decode() or "{}")
+                    if cancel and payload.get("percent") == 99:
+                        _write(self, {"code": "attempt_not_active"}, status=409)
+                        return
+                    body = {}
                 elif self.path.endswith("/lease"):
                     release.set()
+                    control = dict(idle)
+                    if lease_drain:
+                        control["drain"] = True
                     body = {
                         "protocol_version": 1,
                         "lease_expires_at": deadline,
                         "attempt_deadline": deadline,
-                        "control": idle,
+                        "control": control,
                     }
                 elif self.path.endswith("/stopped"):
                     release.set()
@@ -333,7 +456,7 @@ class LeaseTest(unittest.TestCase):
 
             def do_GET(self):
                 seen.append((self.command, self.path, b"", self.headers.get("Authorization")))
-                if not release.wait(8):
+                if not cancel and not release.wait(8):
                     _write(self, {}, status=500)
                     return
                 payload = SAMPLE.read_bytes()
@@ -366,6 +489,15 @@ class LeaseTest(unittest.TestCase):
         server.socket = ctx_server.wrap_socket(server.socket, server_side=True)
         thread = threading.Thread(target=server.serve_forever, daemon=True)
         thread.start()
+        original_convert = client_mod.png_to_pdf
+        if cancel:
+            def blocked_convert(png, _orig=original_convert):
+                if not release.wait(8):
+                    raise AssertionError("cancel did not report stopped")
+                return _orig(png)
+
+            client_mod.png_to_pdf = blocked_convert
+        self.seen = seen
         try:
             port = server.server_address[1]
             serve(
@@ -375,6 +507,7 @@ class LeaseTest(unittest.TestCase):
                 "cd" * 32,
             )
         finally:
+            client_mod.png_to_pdf = original_convert
             server.shutdown()
             server.server_close()
         gets = [item for item in seen if item[0] == "GET"]
